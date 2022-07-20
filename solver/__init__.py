@@ -1,6 +1,7 @@
 import pdb
 
 from torch import optim
+from torch.cuda.amp import GradScaler, autocast
 
 
 def get_optimizer(cfg, model, params=None):
@@ -24,9 +25,9 @@ def get_optimizer(cfg, model, params=None):
         )
 
         return {
-            "model_optimizer": model_optimizer,
-            "value_optimizer": value_optimizer,
-            "actor_optimizer": actor_optimizer,
+            "model_optimizer": [model_optimizer,],
+            "value_optimizer": [value_optimizer,],
+            "actor_optimizer": [actor_optimizer,],
         }
     if cfg.model == "dreamer_plan":
         model_optimizer = opt_fn(
@@ -51,11 +52,11 @@ def get_optimizer(cfg, model, params=None):
         )
 
         return {
-            "model_optimizer": model_optimizer,
-            "value_optimizer": value_optimizer,
-            "actor_optimizer": actor_optimizer,
-            "goal_vae_optimizer": goal_vae_optimizer,
-            "mgr_actor_optimizer": mgr_actor_optimizer,
-            "mgr_value_optimizer": mgr_value_optimizer,
+            "model_optimizer": [model_optimizer, GradScaler()],
+            "value_optimizer": [value_optimizer, GradScaler()],
+            "actor_optimizer": [actor_optimizer, GradScaler()],
+            "goal_vae_optimizer": [goal_vae_optimizer, GradScaler()],
+            "mgr_actor_optimizer": [mgr_actor_optimizer, GradScaler()],
+            "mgr_value_optimizer": [mgr_value_optimizer, GradScaler()],
         }
 

@@ -75,7 +75,7 @@ cfg = CN(
                     "norm": "none",
                 },
             },
-            "decoder": {"dec_type": "conv",},
+            "decoder": {"dec_type": "conv", "latent_only": False},
             "manager": {
                 "K": 8,
                 "cum_intri": True,
@@ -114,8 +114,10 @@ cfg = CN(
             "free_nats": 0.0,
             "kl_balance": 0.8,
             "ent_scale": 1e-3,
+            "mgr_ent_scale": 1e-3,
             "mgr_exp": 0.1,
             "mgr_extr": 1.0,
+            "goal_rec_scale": 1.0,
         },
         "env": {
             "action_size": 18,

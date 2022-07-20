@@ -265,7 +265,7 @@ class Dreamer(nn.Module):
                 "ACT_actor_target": target.mean().detach(),
                 "ACT_actor_baseline": baseline.mean().detach(),
             }
-            if self.actor_loss_type is not "dynamic":
+            if self.actor_loss_type != "dynamic":
                 logs.update(
                     {"ACT_advantage": advantage.detach().mean().item(),}
                 )

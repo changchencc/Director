@@ -92,7 +92,8 @@ def train_16(model, cfg, device):
         if checkpoint:
             model.load_state_dict(checkpoint["model"])
             for k, v in optimizers.items():
-                v.load_state_dict(checkpoint[k])
+                for i in range(len(v)):
+                    v[i].load_state_dict(checkpoint[k][i])
             env_step = checkpoint["env_step"]
             global_step = checkpoint["global_step"]
 
@@ -116,7 +117,7 @@ def train_16(model, cfg, device):
         cfg.data.datadir, cfg.exp_name, cfg.env.name, cfg.run_id, "test_episodes"
     )
     train_env = make_env(cfg, writer, "train", datadir, store=True)
-    test_env = make_env(cfg, writer, "test", test_datadir, store=True)
+    test_env = make_env(cfg, writer, "test", datadir, store=True)
 
     # fill in length of 5000 frames
     train_env.reset()
@@ -144,8 +145,6 @@ def train_16(model, cfg, device):
     K = 0
     action = torch.zeros(1, cfg.env.action_size).float()
     action[0, 0] = 1.0
-
-    scaler = GradScaler()
 
     while global_step < cfg.total_steps:
 
@@ -182,7 +181,7 @@ def train_16(model, cfg, device):
             for k, v in traj.items():
                 traj[k] = v.to(device)
 
-            model_optimizer = optimizers["model_optimizer"]
+            model_optimizer, model_scaler = optimizers["model_optimizer"]
             model_optimizer.zero_grad()
 
             with autocast():
@@ -193,22 +192,23 @@ def train_16(model, cfg, device):
                     post_state,
                 ) = model.world_model_loss(global_step, traj)
 
+            pdb.set_trace()
             grad_norm_model = model.world_model.optimize_world_model16(
-                model_loss, model_optimizer, scaler, global_step, writer
+                model_loss, model_optimizer, model_scaler, global_step, writer
             )
 
-            goal_vae_optimizer = optimizers["goal_vae_optimizer"]
+            goal_vae_optimizer, goal_vae_scaler = optimizers["goal_vae_optimizer"]
             goal_vae_optimizer.zero_grad()
             with autocast():
                 goal_loss, goal_logs = model.goal_vae_loss(post_state)
             grad_norm_goalvae = model.optimize_goalvae16(
-                goal_loss, goal_vae_optimizer, scaler, global_step, writer
+                goal_loss, goal_vae_optimizer, goal_vae_scaler, global_step, writer
             )
 
-            actor_optimizer = optimizers["actor_optimizer"]
-            value_optimizer = optimizers["value_optimizer"]
-            mgr_actor_optimizer = optimizers["mgr_actor_optimizer"]
-            mgr_value_optimizer = optimizers["mgr_value_optimizer"]
+            actor_optimizer, actor_scaler = optimizers["actor_optimizer"]
+            value_optimizer, value_scaler = optimizers["value_optimizer"]
+            mgr_actor_optimizer, mgr_actor_scaler = optimizers["mgr_actor_optimizer"]
+            mgr_value_optimizer, mgr_value_scaler = optimizers["mgr_value_optimizer"]
             actor_optimizer.zero_grad()
             value_optimizer.zero_grad()
             mgr_actor_optimizer.zero_grad()
@@ -223,20 +223,26 @@ def train_16(model, cfg, device):
                 ) = model.actor_and_value_loss(global_step, post_state)
 
             grad_norm_actor = model.optimize_actor16(
-                actor_loss, actor_optimizer, scaler, global_step, writer
+                actor_loss, actor_optimizer, actor_scaler, global_step, writer
             )
             grad_norm_value = model.optimize_value16(
-                value_loss, value_optimizer, scaler, global_step, writer
+                value_loss, value_optimizer, value_scaler, global_step, writer
             )
             if not cfg.arch.worker_only:
                 grad_norm_mgr_actor = model.optimize_mgr_actor16(
-                    mgr_actor_loss, mgr_actor_optimizer, scaler, global_step, writer
+                    mgr_actor_loss,
+                    mgr_actor_optimizer,
+                    mgr_actor_scaler,
+                    global_step,
+                    writer,
                 )
                 grad_norm_mgr_value = model.optimize_mgr_value16(
-                    mgr_value_loss, mgr_value_optimizer, scaler, global_step, writer
+                    mgr_value_loss,
+                    mgr_value_optimizer,
+                    mgr_value_scaler,
+                    global_step,
+                    writer,
                 )
-
-            scaler.update()
 
             if global_step % cfg.train.log_every_step == 0:
                 with torch.no_grad():
@@ -315,7 +321,8 @@ class Learner(mp.Process):
             if checkpoint:
                 model.load_state_dict(checkpoint["model"])
                 for k, v in optimizers.items():
-                    v.load_state_dict(checkpoint[k])
+                    for i in range(len(v)):
+                        v[i].load_state_dict(checkpoint[k][i])
                 env_step = checkpoint["env_step"]
                 global_step = checkpoint["global_step"]
 
@@ -361,7 +368,7 @@ class Learner(mp.Process):
                 for k, v in traj.items():
                     traj[k] = v.to(device)
 
-                model_optimizer = optimizers["model_optimizer"]
+                model_optimizer, model_scaler = optimizers["model_optimizer"]
                 model_optimizer.zero_grad()
 
                 with autocast():
@@ -373,21 +380,25 @@ class Learner(mp.Process):
                     ) = model.world_model_loss(global_step, traj)
 
                 grad_norm_model = model.world_model.optimize_world_model16(
-                    model_loss, model_optimizer, scaler, global_step, writer
+                    model_loss, model_optimizer, model_scaler, global_step, writer
                 )
 
-                goal_vae_optimizer = optimizers["goal_vae_optimizer"]
+                goal_vae_optimizer, goal_vae_scaler = optimizers["goal_vae_optimizer"]
                 goal_vae_optimizer.zero_grad()
                 with autocast():
                     goal_loss, goal_logs = model.goal_vae_loss(post_state)
                 grad_norm_goalvae = model.optimize_goalvae16(
-                    goal_loss, goal_vae_optimizer, scaler, global_step, writer
+                    goal_loss, goal_vae_optimizer, goal_vae_scaler, global_step, writer
                 )
 
-                actor_optimizer = optimizers["actor_optimizer"]
-                value_optimizer = optimizers["value_optimizer"]
-                mgr_actor_optimizer = optimizers["mgr_actor_optimizer"]
-                mgr_value_optimizer = optimizers["mgr_value_optimizer"]
+                actor_optimizer, actor_scaler = optimizers["actor_optimizer"]
+                value_optimizer, value_scaler = optimizers["value_optimizer"]
+                mgr_actor_optimizer, mgr_actor_scaler = optimizers[
+                    "mgr_actor_optimizer"
+                ]
+                mgr_value_optimizer, mgr_value_scaler = optimizers[
+                    "mgr_value_optimizer"
+                ]
                 actor_optimizer.zero_grad()
                 value_optimizer.zero_grad()
                 mgr_actor_optimizer.zero_grad()
@@ -402,20 +413,26 @@ class Learner(mp.Process):
                     ) = model.actor_and_value_loss(global_step, post_state)
 
                 grad_norm_actor = model.optimize_actor16(
-                    actor_loss, actor_optimizer, scaler, global_step, writer
+                    actor_loss, actor_optimizer, actor_scaler, global_step, writer
                 )
                 grad_norm_value = model.optimize_value16(
-                    value_loss, value_optimizer, scaler, global_step, writer
+                    value_loss, value_optimizer, value_scaler, global_step, writer
                 )
                 if not cfg.arch.worker_only:
                     grad_norm_mgr_actor = model.optimize_mgr_actor16(
-                        mgr_actor_loss, mgr_actor_optimizer, scaler, global_step, writer
+                        mgr_actor_loss,
+                        mgr_actor_optimizer,
+                        mgr_actor_scaler,
+                        global_step,
+                        writer,
                     )
                     grad_norm_mgr_value = model.optimize_mgr_value16(
-                        mgr_value_loss, mgr_value_optimizer, scaler, global_step, writer
+                        mgr_value_loss,
+                        mgr_value_optimizer,
+                        mgr_value_scaler,
+                        global_step,
+                        writer,
                     )
-
-                scaler.update()
 
                 if global_step % cfg.train.log_every_step == 0:
                     with torch.no_grad():
@@ -492,9 +509,9 @@ class Actor(mp.Process):
             cfg.data.datadir, cfg.exp_name, cfg.env.name, cfg.run_id, "test_episodes"
         )
         train_env = make_env(cfg, writer, "train", datadir, store=True)
-        test_env = make_env(cfg, writer, "test", test_datadir, store=False)
+        test_env = make_env(cfg, writer, "test", datadir, store=True)
+        verbose = True
 
-        # todo: debug print the run_step
         try:
             train_env.reset()
             steps = count_steps(datadir, cfg)
@@ -517,13 +534,15 @@ class Actor(mp.Process):
 
                 total_actor_step = sum([a.value for a in self.actor_steps])
                 if total_actor_step > self.run_step.value * self.cfg.train.train_every:
-                    print(
-                        f"Actor-{self.idx} waiting for model updating: learner runs {self.run_step.value}, actors collect {total_actor_step} steps"
-                    )
+                    if verbose:
+                        print(
+                            f"Actor-{self.idx} waiting for model updating: learner runs {self.run_step.value}, actors collect {total_actor_step} steps"
+                        )
                     sleep(10)
                     continue
 
                 else:
+                    verbose = False
                     with torch.no_grad():
                         with autocast():
                             image = torch.tensor(obs["image"])
@@ -548,7 +567,7 @@ class Actor(mp.Process):
                             K = 0
                             action = torch.zeros(1, cfg.env.action_size).float()
                 # evaluate RL
-                if global_step % cfg.train.log_every_step == 0:
+                if global_step % (cfg.train.log_every_step * 100) == 0:
                     print(
                         f"Actor-{self.idx}: learner runs {self.run_step.value}, actors collect {total_actor_step} steps"
                     )

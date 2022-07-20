@@ -15,6 +15,7 @@ from time import time
 import numpy as np
 from .utils import RunningMeanStd
 from torch.distributions import OneHotCategorical
+import torchvision.utils as vutils
 
 
 class DreamerPlan(nn.Module):
@@ -31,12 +32,14 @@ class DreamerPlan(nn.Module):
             dense_input_size = self.deter_size + self.stoch_size * self.stoch_discrete
             if not self.worker_only:
                 dense_input_size = (
-                    dense_input_size + self.stoch_discrete * self.stoch_size
+                    dense_input_size + self.deter_size  # conditioned on goal
                 )
         else:
             dense_input_size = self.deter_size + self.stoch_size
             if not self.worker_only:
-                dense_input_size = dense_input_size + self.stoch_size
+                dense_input_size = (
+                    dense_input_size + self.deter_size
+                )  # conditioned on goal
 
         self.actor = ActionDecoder(
             cfg,
@@ -85,6 +88,7 @@ class DreamerPlan(nn.Module):
         self.mgr_value = ManagerValue(cfg.arch.manager, cfg)
         self.mgr_slow_value = ManagerValue(cfg.arch.manager, cfg)
         self.K = cfg.arch.manager.K
+        self.H = cfg.arch.H
         self.cum_intri = cfg.arch.manager.cum_intri
         self.norm_target = cfg.arch.norm_target
         if self.norm_target:
@@ -110,6 +114,9 @@ class DreamerPlan(nn.Module):
         self.n_sample = cfg.train.n_sample
         self.log_grad = cfg.train.log_grad
         self.ent_scale = cfg.loss.ent_scale
+        self.mgr_ent_scale = cfg.loss.mgr_ent_scale
+        self.latent_only = cfg.arch.decoder.latent_only
+        self.goal_rec_scale = cfg.loss.goal_rec_scale
 
         self.r_transform = dict(tanh=torch.tanh, sigmoid=torch.sigmoid,)[
             cfg.rl.r_transform
@@ -130,6 +137,7 @@ class DreamerPlan(nn.Module):
             torch.cat([gt_img[:4], rec_img[:4]], dim=-2).clamp(0.0, 1.0).cpu(),
             global_step=global_step,
         )
+        self.plot_imagine(logs, writer, global_step)
 
         if self.norm_target:
             writer.add_scalar(
@@ -192,17 +200,43 @@ class DreamerPlan(nn.Module):
                         )
                     if isinstance(v, float):
                         writer.add_scalar(tag + "_ACT/" + k, v, global_step=global_step)
-            if "imag_value" in k:
-                writer.add_scalar(
-                    tag + "_values/" + k, v.mean(), global_step=global_step
-                )
-                writer.add_histogram(tag + "_ACT/" + k, v, global_step=global_step)
-            if "actor_target" in k:
-                writer.add_scalar(tag + "actor_target/" + k, v, global_step=global_step)
-
         return self.world_model.gen_samples(
             traj, logs, gt_img, rec_img, global_step, writer
         )
+
+    def plot_imagine(self, logs, writer, global_step):
+        imag_state = logs["ACT_imag_state"]  # n_sample, H, L
+        imag_goal = logs["ACT_mgr_imag_goal"][:4]
+
+        imag_feature = self.world_model.dynamic.get_feature(
+            imag_state, latent_only=self.latent_only
+        )[:4]
+        imag_img = self.world_model.img_dec(imag_feature).mean + 0.5
+
+        goal_latent_state = self.world_model.dynamic.infer_prior_stoch(imag_goal)
+        goal_feature = self.world_model.dynamic.get_feature(goal_latent_state)
+        goal_img = self.world_model.img_dec(goal_feature).mean + 0.5
+        mask = goal_img.new_zeros(goal_img.shape)
+        mask[:, :: self.K] = 1.0
+        goal_img = mask * goal_img
+
+        writer.add_video(
+            "train/imag - goal",
+            torch.cat([imag_img, goal_img], dim=-2).clamp(0.0, 1.0).cpu(),
+            global_step=global_step,
+        )
+        imgs = (
+            torch.stack([imag_img, goal_img], dim=1)
+            .clamp(0.0, 1.0)
+            .cpu()
+            .flatten(end_dim=2)
+        )
+        writer.add_image(
+            "train/imag - goal",
+            vutils.make_grid(imgs, nrow=self.H, pad_value=1),
+            global_step=global_step,
+        )
+        # todo: plot reward
 
     def optimize_actor16(
         self, actor_loss, actor_optimizer, scaler, global_step, writer
@@ -225,6 +259,7 @@ class DreamerPlan(nn.Module):
                         pdb.set_trace()
 
         scaler.step(actor_optimizer)
+        scaler.update()
 
         return grad_norm_actor.item()
 
@@ -249,6 +284,7 @@ class DreamerPlan(nn.Module):
                         pdb.set_trace()
 
         scaler.step(actor_optimizer)
+        scaler.update()
 
         return grad_norm_actor.item()
 
@@ -273,6 +309,7 @@ class DreamerPlan(nn.Module):
                         pdb.set_trace()
 
         scaler.step(value_optimizer)
+        scaler.update()
 
         return grad_norm_value.item()
 
@@ -297,6 +334,7 @@ class DreamerPlan(nn.Module):
                         pdb.set_trace()
 
         scaler.step(value_optimizer)
+        scaler.update()
 
         return grad_norm_value.item()
 
@@ -321,24 +359,9 @@ class DreamerPlan(nn.Module):
                         pdb.set_trace()
 
         scaler.step(goal_vae_optimizer)
+        scaler.update()
 
         return grad_norm_value.item()
-
-    # def optimize_actor32(self, actor_loss, actor_optimizer):
-    #
-    #   actor_loss.backward()
-    #   grad_norm_actor = torch.nn.utils.clip_grad_norm_(get_parameters(self.actor_modules), self.grad_clip)
-    #   actor_optimizer.step()
-    #
-    #   return grad_norm_actor.item()
-    #
-    # def optimize_value32(self, value_loss, value_optimizer):
-    #
-    #   value_loss.backward()
-    #   grad_norm_value = torch.nn.utils.clip_grad_norm_(get_parameters(self.value_modules), self.grad_clip)
-    #   value_optimizer.step()
-    #
-    #   return grad_norm_value.item()
 
     def world_model_loss(self, global_step, traj):
         return self.world_model.compute_loss(traj, global_step)
@@ -347,32 +370,24 @@ class DreamerPlan(nn.Module):
         """
         state: B, T, S
         """
-        s_t = state["stoch"].detach()
-        if self.stoch_discrete:
-            shape = s_t.shape
-            s_t_reshape = s_t.reshape(
-                [*shape[:-2]] + [self.stoch_size * self.stoch_discrete]
-            )
-        else:
-            s_t_reshape = s_t
-        z_dist = self.goal_vae.enc(s_t_reshape)
+        s_t = state["deter"].detach()
+        z_dist = self.goal_vae.enc(s_t)
         z = z_dist.sample()  # B, T, K, L
         z = z + z_dist.mean - z_dist.mean.detach()
         goal_dist = self.goal_vae.dec(z.flatten(start_dim=-2))  # B, S
 
-        kl_loss = self.goal_vae.kl_loss(z_dist).sum(-1).mean()
-        if self.stoch_discrete:
-            state_indices = s_t.max(-1)[1]
-            rec_loss = -goal_dist._categorical.log_prob(state_indices).sum(-1).mean()
-            goal_mse = ((s_t - goal_dist.mean) ** 2).sum(dim=(-1, -2)).mean()
-        else:
-            rec_loss = -goal_dist.log_prob(s_t).mean()  # B, T
-            goal_mse = ((s_t - goal_dist.mean) ** 2).sum(-1).mean()
-        goal_loss = kl_loss + rec_loss
+        kl_loss = self.goal_vae.kl_loss(z_dist).sum(-1)
+        kl_loss = kl_loss.mean()
+
+        rec_loss = -goal_dist.log_prob(s_t).mean()  # B, T
+        goal_mse = ((s_t - goal_dist.mean) ** 2).sum(-1).mean()
+        goal_loss = kl_loss + self.goal_rec_scale * rec_loss
         logs = {
             "Loss_goal_rec_loss": rec_loss.detach().item(),
             "Loss_goal_kl_loss": kl_loss.detach().item(),
             "ACT_goal_mse_loss": goal_mse.detach().item(),
+            "ACT_goalvae_entropy": z_dist.entropy().sum(-1).mean().detach(),
+            "ACT_goalvae_latent_entropy": goal_dist.entropy().mean().detach(),
         }
         return goal_loss, logs
 
@@ -392,23 +407,10 @@ class DreamerPlan(nn.Module):
 
         def compute_mgr_intri_reward(imag_s):
 
-            if self.stoch_discrete:
-                shape = imag_s.shape
-                imag_s = imag_s.reshape(
-                    [*shape[:-2]] + [self.stoch_size * self.stoch_discrete]
-                )
             z_dist = self.goal_vae.enc(imag_s.detach())
             z = z_dist.sample()  # B, T, K, L
             goal_dist = self.goal_vae.dec(z.flatten(start_dim=-2))  # B, S
-            if self.stoch_discrete:
-                probs = goal_dist.probs  # B, S, L, L
-                index = probs.argmax(-1)
-                index = index.unsqueeze(-1).expand(probs.shape)
-                rec_s = probs.new_zeros(probs.shape)
-                rec_s.scatter_(-1, index, 1.0)
-                rec_s = rec_s.flatten(start_dim=-2)
-            else:
-                rec_s = goal_dist.mean
+            rec_s = goal_dist.mean
             intri_r = ((rec_s - imag_s) ** 2).sum(-1)
 
             if self.cum_intri:
@@ -446,11 +448,6 @@ class DreamerPlan(nn.Module):
         imag_goal: B, H, S
         imag_goal: B, H, S
         """
-        if self.stoch_discrete:
-            shape = imag_state.shape
-            imag_state = imag_state.reshape(
-                [*shape[:-2]] + [self.stoch_size * self.stoch_discrete]
-            )
         g_norm = torch.linalg.norm(imag_goal, dim=-1)
         s_norm = torch.linalg.norm(imag_state, dim=-1)
 
@@ -468,10 +465,10 @@ class DreamerPlan(nn.Module):
     def compute_mgr_and_worker_reward(self, imag_g, imag_state, imag_r):
 
         worker_r = self.compute_worker_reward(
-            imag_g[:, :-1], imag_state["stoch"][:, 1:].detach()
+            imag_g[:, :-1], imag_state["deter"][:, 1:].detach()
         )
         mgr_ext_r, mgr_intr_r = self.compute_manager_reward(
-            imag_r[:, 1:], imag_state["stoch"][:, 1:].detach()
+            imag_r[:, 1:], imag_state["deter"][:, 1:].detach()
         )
 
         return worker_r, mgr_ext_r, mgr_intr_r
@@ -517,17 +514,37 @@ class DreamerPlan(nn.Module):
             worker_imag_feat = torch.cat([imag_feat, imag_goal], dim=-1)
         worker_value = self.slow_value(worker_imag_feat).mean  # B*T, H, 1
 
-        target, weights = self.compute_target(
-            worker_r, imag_disc, worker_value
-        )  # B*T, H-1, 1
+        if not self.worker_only:
+            target_1, weights_1 = self.compute_target(
+                worker_r[:, : self.K],
+                imag_disc[:, : self.K + 1],
+                worker_value[:, : self.K + 1],
+            )  # B*T, H-1, 1
+            target_2, weights_2 = self.compute_target(
+                worker_r[:, self.K :],
+                imag_disc[:, self.K :],
+                worker_value[:, self.K :],
+            )  # B*T, H-1, 1
+            target = torch.cat([target_1, target_2], dim=1)
+            weights = torch.cat([weights_1[:, :-1], weights_2], dim=1)
+        else:
+            target, weights = self.compute_target(
+                worker_r, imag_disc, worker_value
+            )  # B*T, H-1, 1
 
-        actor_dist = self.actor(imag_feat.detach(), imag_goal.detach())  # B*T, H
-        indices = imag_action.max(-1)[1]
-        actor_logprob = actor_dist._categorical.log_prob(indices)
+        if self.actor_loss_type == "reinforce":
+            actor_dist = self.actor(imag_feat.detach(), imag_goal.detach())  # B*T, H
+            indices = imag_action.max(-1)[1]
+            actor_logprob = actor_dist._categorical.log_prob(indices)
 
-        baseline = self.value(worker_imag_feat[:, :-1]).mean
-        advantage = (target - baseline).detach()
-        actor_loss = actor_logprob[:, :-1].unsqueeze(2) * advantage
+            baseline = self.value(worker_imag_feat[:, :-1]).mean
+            advantage = (target - baseline).detach()
+            actor_loss = actor_logprob[:, :-1].unsqueeze(2) * advantage
+
+        elif self.actor_loss_type == "dynamic":
+            actor_loss = target
+        else:
+            raise NotImplemented
 
         actor_entropy = actor_dist.entropy()
         ent_scale = self.ent_scale
@@ -543,6 +560,7 @@ class DreamerPlan(nn.Module):
 
         # mgr loss
 
+        # worker only is used for sanity check
         if not self.worker_only:
             self.mgr_slow_value.eval()
             self.mgr_slow_value.requires_grad_(False)
@@ -599,10 +617,9 @@ class DreamerPlan(nn.Module):
             mgr_actor_loss = mgr_actor_logprob[:, :-1].unsqueeze(2) * mgr_advantage
 
             mgr_actor_entropy = mgr_actor_dist.entropy().sum(-1)
-            # ent_scale = self.ent_scale
-            # todo: remove entropy
             # mgr_actor_loss = (
-            #     ent_scale * mgr_actor_entropy[:, :-1].unsqueeze(2) + mgr_actor_loss
+            #     self.mgr_ent_scale * mgr_actor_entropy[:, :-1].unsqueeze(2)
+            #     + mgr_actor_loss
             # )
             mgr_actor_loss = -(mgr_weights[:, :-1] * mgr_actor_loss).mean()
 
@@ -619,10 +636,7 @@ class DreamerPlan(nn.Module):
             mgr_intri_log_prob = -mgr_intri_value.log_prob(mgr_intri_target.detach())
             mgr_intri_value_loss = mgr_weights[:, :-1] * mgr_intri_log_prob.unsqueeze(2)
             mgr_intri_value_loss = mgr_intri_value_loss.mean()
-            mgr_value_loss = (
-                self.mgr_extr * mgr_extr_value_loss
-                + self.mgr_exp * mgr_intri_value_loss
-            )
+            mgr_value_loss = mgr_extr_value_loss + mgr_intri_value_loss
         else:
             mgr_actor_loss = 0.0
             mgr_value_loss = 0.0
@@ -643,7 +657,7 @@ class DreamerPlan(nn.Module):
                 "ACT_actor_baseline": baseline.mean().detach(),
                 "ACT_actor_reward": worker_r.mean().detach(),
             }
-            if self.actor_loss_type is not "dynamic":
+            if self.actor_loss_type != "dynamic":
                 logs.update(
                     {"ACT_advantage": advantage.detach().mean().item(),}
                 )
@@ -664,6 +678,7 @@ class DreamerPlan(nn.Module):
                         "ACT_mgr_extr_advantage": mgr_ext_adv.mean().detach(),
                         "ACT_mgr_intri_advantage": mgr_intri_adv.mean().detach(),
                         "ACT_mgr_weights": mgr_weights.mean().detach(),
+                        "ACT_mgr_imag_goal": imag_goal.detach(),
                     }
                 )
         else:
@@ -693,14 +708,7 @@ class DreamerPlan(nn.Module):
         # if self.mgr_actor_include_deter:
         rnn_feature = self.world_model.dynamic.get_feature(state).detach()
         z_dist = self.mgr_actor(rnn_feature)
-        # else:
-        #     rnn_feature = state["stoch"]
-        #     if self.stoch_discrete:
-        #         shape = rnn_feature.shape
-        #         rnn_feature = rnn_feature.reshape(
-        #             [*shape[:-2]] + [self.stoch_size * self.stoch_discrete]
-        #         )
-        #     z_dist = self.mgr_actor(rnn_feature)
+
         if sample:
             z = z_dist.sample() + z_dist.mean - z_dist.mean.detach()  # B, K, L
         else:
@@ -710,16 +718,15 @@ class DreamerPlan(nn.Module):
             z = probs.new_zeros(probs.shape)
             z.scatter_(-1, index, 1.0)
 
-        if self.stoch_discrete:
-            goal_dist = self.goal_vae.dec(z.flatten(start_dim=-2))  # B, S
-            probs = goal_dist.probs  # B, S, L, L
-            index = probs.argmax(-1)
-            index = index.unsqueeze(-1).expand(probs.shape)
-            goal = probs.new_zeros(probs.shape)
-            goal.scatter_(-1, index, 1.0)
-            goal = goal.flatten(start_dim=-2)
-        else:
-            goal = self.goal_vae.dec(z.flatten(start_dim=-2)).mean  # B, S
+        # if self.stoch_discrete:
+        #     goal_dist = self.goal_vae.dec(z.flatten(start_dim=-2))  # B, S
+        #     probs = goal_dist.probs  # B, S, L, L
+        #     index = probs.argmax(-1)
+        #     index = index.unsqueeze(-1).expand(probs.shape)
+        #     goal = probs.new_zeros(probs.shape)
+        #     goal.scatter_(-1, index, 1.0)
+        #     goal = goal.flatten(start_dim=-2)
+        goal = self.goal_vae.dec(z.flatten(start_dim=-2)).mean  # B, S
 
         return goal, z
 
@@ -733,7 +740,7 @@ class DreamerPlan(nn.Module):
         if state is None:
             state = self.world_model.dynamic.init_state(obs.shape[0], obs.device)
         if sample_goal:
-            goal, _ = self.manager_policy(state)
+            goal, _ = self.manager_policy(state, sample=training)
 
         deter, stoch = state["deter"], state["stoch"]
         deter = self.world_model.dynamic.rnn_forward(action, stoch, deter)

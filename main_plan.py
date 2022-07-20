@@ -1,6 +1,6 @@
 import torch
 from configs import cfg
-from engine.train_v2_plan import train_32, train_16
+from engine.train_v2_plan_mpenv import train_16
 from model import get_model
 from envs.atari_env import Atari
 import os
@@ -41,9 +41,10 @@ def get_config():
         else:
             cfg.exp_name = os.path.splitext(os.path.basename(args.config_file))[0]
 
-    task = {"train_32": train_32, "train_16": train_16,}[args.task]
+    task = train_16
 
     return task, cfg
+
 
 if __name__ == "__main__":
     task, cfg = get_config()

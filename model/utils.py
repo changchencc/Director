@@ -464,11 +464,11 @@ class LayerNormGRUCellV2(nn.Module):
 
     def forward(self, x, h):
         """
-    GRU for slot attention.
-    inputs:
-      x: (bs, N, c), or (bs, C)
-      h: (bs, N, h), or (bs, C)
-    """
+        GRU for slot attention.
+        inputs:
+            x: (bs, N, c), or (bs, C)
+            h: (bs, N, h), or (bs, C)
+        """
 
         if h is None:
             h = self.init_state(x.shape)
@@ -1167,10 +1167,11 @@ def get_named_parameters(modules, name):
 
 class RunningMeanStd(object):
     # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
-    def __init__(self, epsilon=1e-4, shape=()):
+    def __init__(self, epsilon=1e-4, momentum=0.999, shape=()):
         self.mean = np.zeros(shape, "float64")
         self.var = np.ones(shape, "float64")
         self.count = epsilon
+        self.momentum = momentum
 
     def update(self, x):
         batch_mean = np.mean(x, axis=0)
@@ -1195,7 +1196,7 @@ class RunningMeanStd(object):
         new_count = batch_count + self.count
 
         self.mean = new_mean
-        self.var = new_var
+        self.var = self.momentum * new_var + (1 - self.momentum) * self.var
         self.count = new_count
 
 
