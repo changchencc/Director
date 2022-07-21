@@ -115,8 +115,8 @@ class DreamerPlan(nn.Module):
         self.log_grad = cfg.train.log_grad
         self.ent_scale = cfg.loss.ent_scale
         self.mgr_ent_scale = cfg.loss.mgr_ent_scale
-        self.latent_only = cfg.arch.decoder.latent_only
         self.goal_rec_scale = cfg.loss.goal_rec_scale
+        self.debug_worker = cfg.arch.debug_worker
 
         self.r_transform = dict(tanh=torch.tanh, sigmoid=torch.sigmoid,)[
             cfg.rl.r_transform
@@ -198,6 +198,12 @@ class DreamerPlan(nn.Module):
                         writer.add_scalar(
                             tag + "_mean_ACT/" + k, v.mean(), global_step=global_step
                         )
+                        writer.add_scalar(
+                            tag + "_max_ACT/" + k, v.max(), global_step=global_step
+                        )
+                        writer.add_scalar(
+                            tag + "_min_ACT/" + k, v.min(), global_step=global_step
+                        )
                     if isinstance(v, float):
                         writer.add_scalar(tag + "_ACT/" + k, v, global_step=global_step)
         return self.world_model.gen_samples(
@@ -208,9 +214,7 @@ class DreamerPlan(nn.Module):
         imag_state = logs["ACT_imag_state"]  # n_sample, H, L
         imag_goal = logs["ACT_mgr_imag_goal"][:4]
 
-        imag_feature = self.world_model.dynamic.get_feature(
-            imag_state, latent_only=self.latent_only
-        )[:4]
+        imag_feature = self.world_model.dynamic.get_feature(imag_state)[:4]
         imag_img = self.world_model.img_dec(imag_feature).mean + 0.5
 
         goal_latent_state = self.world_model.dynamic.infer_prior_stoch(imag_goal)
@@ -386,8 +390,8 @@ class DreamerPlan(nn.Module):
             "Loss_goal_rec_loss": rec_loss.detach().item(),
             "Loss_goal_kl_loss": kl_loss.detach().item(),
             "ACT_goal_mse_loss": goal_mse.detach().item(),
-            "ACT_goalvae_entropy": z_dist.entropy().sum(-1).mean().detach(),
-            "ACT_goalvae_latent_entropy": goal_dist.entropy().mean().detach(),
+            "ACT_goalvae_latent_entropy": z_dist.entropy().sum(-1).mean().detach(),
+            "ACT_goalvae_latent_sample": z_dist.mean.argmax(-1).float().detach(),
         }
         return goal_loss, logs
 
@@ -464,6 +468,7 @@ class DreamerPlan(nn.Module):
 
     def compute_mgr_and_worker_reward(self, imag_g, imag_state, imag_r):
 
+        # todo: not detaching state for worker reward
         worker_r = self.compute_worker_reward(
             imag_g[:, :-1], imag_state["deter"][:, 1:].detach()
         )
@@ -503,6 +508,8 @@ class DreamerPlan(nn.Module):
                 worker_r, mgr_ext_r, mgr_intri_r = self.compute_mgr_and_worker_reward(
                     imag_goal.detach(), imag_state, imag_reward.detach(),
                 )
+                if self.debug_worker:
+                    worker_r += imag_reward[:, 1:]
         else:
             worker_r = imag_reward[:, 1:]
 
@@ -514,23 +521,23 @@ class DreamerPlan(nn.Module):
             worker_imag_feat = torch.cat([imag_feat, imag_goal], dim=-1)
         worker_value = self.slow_value(worker_imag_feat).mean  # B*T, H, 1
 
-        if not self.worker_only:
-            target_1, weights_1 = self.compute_target(
-                worker_r[:, : self.K],
-                imag_disc[:, : self.K + 1],
-                worker_value[:, : self.K + 1],
-            )  # B*T, H-1, 1
-            target_2, weights_2 = self.compute_target(
-                worker_r[:, self.K :],
-                imag_disc[:, self.K :],
-                worker_value[:, self.K :],
-            )  # B*T, H-1, 1
-            target = torch.cat([target_1, target_2], dim=1)
-            weights = torch.cat([weights_1[:, :-1], weights_2], dim=1)
-        else:
-            target, weights = self.compute_target(
-                worker_r, imag_disc, worker_value
-            )  # B*T, H-1, 1
+        # if not self.worker_only:
+        # target_1, weights_1 = self.compute_target(
+        #     worker_r[:, : self.K],
+        #     imag_disc[:, : self.K + 1],
+        #     worker_value[:, : self.K + 1],
+        # )  # B*T, H-1, 1
+        # target_2, weights_2 = self.compute_target(
+        #     worker_r[:, self.K :],
+        #     imag_disc[:, self.K :],
+        #     worker_value[:, self.K :],
+        # )  # B*T, H-1, 1
+        # target = torch.cat([target_1, target_2], dim=1)
+        # weights = torch.cat([weights_1[:, :-1], weights_2], dim=1)
+        # else:
+        target, weights = self.compute_target(
+            worker_r, imag_disc, worker_value
+        )  # B*T, H-1, 1
 
         if self.actor_loss_type == "reinforce":
             actor_dist = self.actor(imag_feat.detach(), imag_goal.detach())  # B*T, H
@@ -617,10 +624,10 @@ class DreamerPlan(nn.Module):
             mgr_actor_loss = mgr_actor_logprob[:, :-1].unsqueeze(2) * mgr_advantage
 
             mgr_actor_entropy = mgr_actor_dist.entropy().sum(-1)
-            # mgr_actor_loss = (
-            #     self.mgr_ent_scale * mgr_actor_entropy[:, :-1].unsqueeze(2)
-            #     + mgr_actor_loss
-            # )
+            mgr_actor_loss = (
+                self.mgr_ent_scale * mgr_actor_entropy[:, :-1].unsqueeze(2)
+                + mgr_actor_loss
+            )
             mgr_actor_loss = -(mgr_weights[:, :-1] * mgr_actor_loss).mean()
 
             self.mgr_value.train()
@@ -679,6 +686,7 @@ class DreamerPlan(nn.Module):
                         "ACT_mgr_intri_advantage": mgr_intri_adv.mean().detach(),
                         "ACT_mgr_weights": mgr_weights.mean().detach(),
                         "ACT_mgr_imag_goal": imag_goal.detach(),
+                        "ACT_mgr_imag_action": mgr_indices.float().detach(),
                     }
                 )
         else:
@@ -710,7 +718,7 @@ class DreamerPlan(nn.Module):
         z_dist = self.mgr_actor(rnn_feature)
 
         if sample:
-            z = z_dist.sample() + z_dist.mean - z_dist.mean.detach()  # B, K, L
+            z = z_dist.sample()  # B, K, L
         else:
             probs = z_dist.probs
             index = probs.argmax(-1)

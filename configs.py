@@ -20,6 +20,7 @@ cfg = CN(
             "norm_target": True,
             "norm_reward": True,
             "worker_only": False,
+            "debug_worker": False,
             "actor": {
                 "num_units": 400,
                 "act": "elu",
@@ -58,7 +59,6 @@ cfg = CN(
                     "hidden_size": 600,
                     "rnn_type": "LayerNormGRU",
                     "ST": True,
-                    "post_no_deter": False,
                 },
                 "reward": {
                     "num_units": 400,
@@ -75,7 +75,7 @@ cfg = CN(
                     "norm": "none",
                 },
             },
-            "decoder": {"dec_type": "conv", "latent_only": False},
+            "decoder": {"dec_type": "conv"},
             "manager": {
                 "K": 8,
                 "cum_intri": True,

@@ -440,7 +440,7 @@ class LayerNormGRUCellV2(nn.Module):
 
         self.fc = Linear(
             input_size, 3 * hidden_size, bias=False
-        )  # we have layernorm, bias is redundant
+        )  # we have layernorm, bias is redundant, but DreamerV2 code has it
         # self.fc_h2h = Linear(hidden_size, 2*hidden_size, bias=False)
         # self.fc_i2c = Linear(input_size, hidden_size, bias=False)
         # self.fc_h2c = Linear(hidden_size, hidden_size, bias=False)

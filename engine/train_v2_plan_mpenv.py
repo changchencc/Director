@@ -192,7 +192,6 @@ def train_16(model, cfg, device):
                     post_state,
                 ) = model.world_model_loss(global_step, traj)
 
-            pdb.set_trace()
             grad_norm_model = model.world_model.optimize_world_model16(
                 model_loss, model_optimizer, model_scaler, global_step, writer
             )
@@ -354,7 +353,6 @@ class Learner(mp.Process):
         )
         train_dl = DataLoader(train_ds, batch_size=cfg.train.batch_size, num_workers=4)
         train_iter = iter(train_dl)
-        scaler = GradScaler()
         self.run_step.value = 0
 
         print(f"collected {steps} steps. Start training...")
@@ -566,6 +564,7 @@ class Actor(mp.Process):
                             goal = None
                             K = 0
                             action = torch.zeros(1, cfg.env.action_size).float()
+                            action[0, 0] = 1.0
                 # evaluate RL
                 if global_step % (cfg.train.log_every_step * 100) == 0:
                     print(

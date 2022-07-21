@@ -1,9 +1,12 @@
 import numpy as np
+import gym
+import os
 
 
 class DeepMindControl:
     def __init__(self, name, action_repeat=1, size=(64, 64), camera=None):
         domain, task = name.split("_", 1)
+        os.environ["MUJOCO"] = "egl"
         if domain == "cup":  # Only domain with multiple words.
             domain = "ball_in_cup"
         if isinstance(domain, str):
@@ -30,7 +33,7 @@ class DeepMindControl:
     @property
     def action_space(self):
         spec = self._env.action_spec()
-        return gym.spaces.Box(spec.minimum, spec.maximum, dtype=np.float32)
+        return {"action": gym.spaces.Box(spec.minimum, spec.maximum, dtype=np.float32)}
 
     def step(self, action):
         assert np.isfinite(action).all(), action

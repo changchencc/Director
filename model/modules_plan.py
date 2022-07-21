@@ -66,7 +66,6 @@ class RSSMWorldModel(nn.Module):
         self.free_nats = cfg.loss.free_nats
         self.H = cfg.arch.H
         self.grad_clip = cfg.optimize.grad_clip
-        self.latent_only = cfg.arch.decoder.latent_only
 
         self.discount = cfg.rl.discount
         self.lambda_ = cfg.rl.lambda_
@@ -102,12 +101,7 @@ class RSSMWorldModel(nn.Module):
 
         rnn_feature = self.dynamic.get_feature(post_state)
 
-        if self.latent_only:
-            image_pred_pdf = self.img_dec(
-                self.dynamic.get_feature(post_state, latent_only=True)
-            )
-        else:
-            image_pred_pdf = self.img_dec(rnn_feature)  # B, T, 3, 64, 64
+        image_pred_pdf = self.img_dec(rnn_feature)  # B, T, 3, 64, 64
 
         reward_pred_pdf = self.reward(rnn_feature)  # B, T, 1
 
@@ -171,9 +165,8 @@ class RSSMWorldModel(nn.Module):
                 "ACT_post_entropy": post_dist.entropy().mean().detach().item(),
                 "dec_img": image_pred_pdf.mean.detach() + 0.5,  # B, T, 3, 64, 64
                 "gt_img": obs + 0.5,
-                "pred_reward": pred_reward.detach().squeeze(-1),
-                "gt_reward": reward,
-                "reward_input": rnn_feature.detach(),
+                "ACT_pred_reward": pred_reward.detach().squeeze(-1),
+                "ACT_gt_reward": reward,
                 "Loss_model_discount_logprob_loss": pcont_loss.detach().item(),
                 "discount_acc": discount_acc.detach(),
                 "pred_discount": pred_pcont.mean.detach(),
@@ -242,16 +235,12 @@ class RSSMWorldModel(nn.Module):
 
             rnn_feature = self.dynamic.get_feature(pred_prior)
             if t % self.K == 0:
-                g, z = mgr_actor(pred_prior, sample=False)
+                g, z = mgr_actor(pred_prior, sample=True)
             goal_list.append(g)
             mgr_action_list.append(z)
 
             pred_action_pdf = actor(rnn_feature.detach(), g.detach())
             action = pred_action_pdf.sample()
-            # todo: do I need this?
-            # action = (
-            #     action + pred_action_pdf.probs - pred_action_pdf.probs.detach()
-            # )  # straight through
 
             pred_deter = self.dynamic.rnn_forward(
                 action, pred_prior["stoch"], pred_prior["deter"]
@@ -300,25 +289,17 @@ class RSSMWorldModel(nn.Module):
             prev_deter = logs["ACT_prior_state"]["deter"][:, self.n_sample - 1].detach()
             rnn_features = []
             stoch_state = []
-            latent_features = []
             for t in range(self.batch_length - self.n_sample):
                 prev_deter = self.dynamic.rnn_forward(
                     pred_action[:, t], prev_stoch, prev_deter
                 )
                 prior = self.dynamic.infer_prior_stoch(prev_deter)
                 rnn_features.append(self.dynamic.get_feature(prior))
-                latent_features.append(
-                    self.dynamic.get_feature(prior, latent_only=self.latent_only)
-                )
                 stoch_state.append(prior["stoch"])
 
             rnn_features = torch.stack(rnn_features, dim=1)  # B, T-n_sample, H
-            latent_features = torch.stack(latent_features, dim=1)  # B, T-n_sample, H
 
-            if self.latent_only:
-                pred_imgs = self.img_dec(latent_features).mean + 0.5  # B, T, 3, 64, 64
-            else:
-                pred_imgs = self.img_dec(rnn_features).mean + 0.5  # B, T, 3, 64, 64
+            pred_imgs = self.img_dec(rnn_features).mean + 0.5  # B, T, 3, 64, 64
 
             reward_pred_pdf = self.reward(rnn_features)  # B, T, 1
             pred_reward_pred_loss = -reward_pred_pdf.log_prob(
@@ -399,7 +380,6 @@ class RSSM(nn.Module):
         self.stoch_size = cfg.arch.world_model.RSSM.stoch_size
         self.stoch_discrete = cfg.arch.world_model.RSSM.stoch_discrete
         self.ST = cfg.arch.world_model.RSSM.ST
-        self.post_no_deter = cfg.arch.world_model.RSSM.post_no_deter
         self.norm = cfg.arch.world_model.norm
 
         self.img_enc = ImgEncoder(cfg)
@@ -424,24 +404,16 @@ class RSSM(nn.Module):
                 hidden_size,
                 weight_init=weight_init,
             )
-            if self.post_no_deter:
-                self.post_stoch_mlp = MLP(
-                    [1536, hidden_size, self.stoch_size * self.stoch_discrete],
-                    act=act,
-                    weight_init=weight_init,
-                    norm=self.norm,
-                )
-            else:
-                self.post_stoch_mlp = MLP(
-                    [
-                        1536 + deter_size,
-                        hidden_size,
-                        self.stoch_size * self.stoch_discrete,
-                    ],
-                    act=act,
-                    weight_init=weight_init,
-                    norm=self.norm,
-                )
+            self.post_stoch_mlp = MLP(
+                [
+                    1536 + deter_size,
+                    hidden_size,
+                    self.stoch_size * self.stoch_discrete,
+                ],
+                act=act,
+                weight_init=weight_init,
+                norm=self.norm,
+            )
             self.prior_stoch_mlp = MLP(
                 [deter_size, hidden_size, self.stoch_size * self.stoch_discrete],
                 act=act,
@@ -483,15 +455,15 @@ class RSSM(nn.Module):
 
     def forward(self, traj, prev_state):
         """
-    traj:
-      observations: embedding of observed images, B, T, C
-      actions: (one-hot) vector in action space, B, T, d_act
-      dones: scalar, B, T
+        traj:
+          observations: embedding of observed images, B, T, C
+          actions: (one-hot) vector in action space, B, T, d_act
+          dones: scalar, B, T
 
-    prev_state:
-      deter: GRU hidden state, B, h1
-      stoch: RSSM stochastic state, B, h2
-    """
+        prev_state:
+          deter: GRU hidden state, B, h1
+          stoch: RSSM stochastic state, B, h2
+        """
 
         obs = traj["image"]
         obs = obs / 255.0 - 0.5
@@ -507,7 +479,7 @@ class RSSM(nn.Module):
 
         return prior, post
 
-    def get_feature(self, state, latent_only=False):
+    def get_feature(self, state):
 
         if self.stoch_discrete:
             shape = state["stoch"].shape
@@ -515,16 +487,10 @@ class RSSM(nn.Module):
                 [*shape[:-2]] + [self.stoch_size * self.stoch_discrete]
             )
 
-            if latent_only:
-                return stoch
-            else:
-                return torch.cat([stoch, state["deter"]], dim=-1)  # B, T, 2H
+            return torch.cat([stoch, state["deter"]], dim=-1)  # B, T, 2H
 
         else:
-            if latent_only:
-                return state["stoch"]
-            else:
-                return torch.cat([state["stoch"], state["deter"]], dim=-1)  # B, T, 2H
+            return torch.cat([state["stoch"], state["deter"]], dim=-1)  # B, T, 2H
 
     def get_dist(self, state, detach=False):
         if self.stoch_discrete:
@@ -615,6 +581,12 @@ class RSSM(nn.Module):
                 if self.ST:
                     stoch = stoch + dist.mean - dist.mean.detach()
             # todo: sample=False
+            else:
+                probs = dist.mean
+                index = probs.argmax(-1)
+                index = index.unsqueeze(-1).expand(probs.shape)
+                stoch = probs.new_zeros(probs.shape)
+                stoch.scatter_(-1, index, 1.0)
 
             prior_state = {
                 "logits": logits,
@@ -638,10 +610,7 @@ class RSSM(nn.Module):
 
     def infer_post_stoch(self, observation, prev_deter):
 
-        if self.post_no_deter:
-            logits = self.post_stoch_mlp(observation)
-        else:
-            logits = self.post_stoch_mlp(torch.cat([observation, prev_deter], dim=-1))
+        logits = self.post_stoch_mlp(torch.cat([observation, prev_deter], dim=-1))
         logits = logits.float()
 
         if self.stoch_discrete:
@@ -754,24 +723,16 @@ class ImgDecoder(nn.Module):
         depth = 48
         self.c_out = 1 if cfg.env.grayscale else 3
         self.stoch_discrete = cfg.arch.world_model.RSSM.stoch_discrete
-        self.latent_only = cfg.arch.decoder.latent_only
         if self.stoch_discrete:
-            if self.latent_only:
-                input_size = cfg.arch.world_model.RSSM.stoch_size * self.stoch_discrete
-            else:
-                input_size = (
-                    cfg.arch.world_model.RSSM.deter_size
-                    + cfg.arch.world_model.RSSM.stoch_size * self.stoch_discrete
-                )
+            input_size = (
+                cfg.arch.world_model.RSSM.deter_size
+                + cfg.arch.world_model.RSSM.stoch_size * self.stoch_discrete
+            )
         else:
-            if self.latent_only:
-
-                input_size = cfg.arch.world_model.RSSM.stoch_size
-            else:
-                input_size = (
-                    cfg.arch.world_model.RSSM.deter_size
-                    + cfg.arch.world_model.RSSM.stoch_size
-                )
+            input_size = (
+                cfg.arch.world_model.RSSM.deter_size
+                + cfg.arch.world_model.RSSM.stoch_size
+            )
         self.fc = Linear(input_size, 1536, bias=True, weight_init="xavier")
         n_group_norm = 1 if cfg.arch.world_model.norm != "none" else 0
         if cfg.arch.decoder.dec_type == "conv":
