@@ -98,7 +98,7 @@ def make_env(cfg, writer, prefix, datadir, store, seed=0):
     else:
         raise NotImplementedError(suite)
 
-    env = TimeLimit(env, cfg.env.time_limit, cfg.env.time_penalty)
+    env = TimeLimit(env, cfg.env.time_limit)
 
     callbacks = []
     if store:

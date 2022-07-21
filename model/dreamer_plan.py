@@ -27,6 +27,7 @@ class DreamerPlan(nn.Module):
         self.stoch_size = cfg.arch.world_model.RSSM.stoch_size
         self.deter_size = cfg.arch.world_model.RSSM.deter_size
         self.worker_only = cfg.arch.worker_only
+        # todo: here goal input
         if self.stoch_discrete:
             dense_input_size = self.deter_size + self.stoch_size * self.stoch_discrete
             if not self.worker_only:
@@ -68,6 +69,7 @@ class DreamerPlan(nn.Module):
         )
         self.goal_vae = GoalVAE(cfg)
 
+        # todo: here goal input
         if self.stoch_discrete:
             mgr_input = self.stoch_size * self.stoch_discrete + self.deter_size
         else:
@@ -110,6 +112,7 @@ class DreamerPlan(nn.Module):
         self.n_sample = cfg.train.n_sample
         self.log_grad = cfg.train.log_grad
         self.ent_scale = cfg.loss.ent_scale
+        self.goal_type = cfg.arch.manager.input_type
 
         self.r_transform = dict(tanh=torch.tanh, sigmoid=torch.sigmoid,)[
             cfg.rl.r_transform
@@ -324,22 +327,6 @@ class DreamerPlan(nn.Module):
 
         return grad_norm_value.item()
 
-    # def optimize_actor32(self, actor_loss, actor_optimizer):
-    #
-    #   actor_loss.backward()
-    #   grad_norm_actor = torch.nn.utils.clip_grad_norm_(get_parameters(self.actor_modules), self.grad_clip)
-    #   actor_optimizer.step()
-    #
-    #   return grad_norm_actor.item()
-    #
-    # def optimize_value32(self, value_loss, value_optimizer):
-    #
-    #   value_loss.backward()
-    #   grad_norm_value = torch.nn.utils.clip_grad_norm_(get_parameters(self.value_modules), self.grad_clip)
-    #   value_optimizer.step()
-    #
-    #   return grad_norm_value.item()
-
     def world_model_loss(self, global_step, traj):
         return self.world_model.compute_loss(traj, global_step)
 
@@ -373,6 +360,8 @@ class DreamerPlan(nn.Module):
             "Loss_goal_rec_loss": rec_loss.detach().item(),
             "Loss_goal_kl_loss": kl_loss.detach().item(),
             "ACT_goal_mse_loss": goal_mse.detach().item(),
+            "ACT_goal_z_entropy": z_dist.entropy().mean().detach(),
+            "ACT_goal_z_code": z.argmax(-1).float().detach(),
         }
         return goal_loss, logs
 
@@ -643,7 +632,7 @@ class DreamerPlan(nn.Module):
                 "ACT_actor_baseline": baseline.mean().detach(),
                 "ACT_actor_reward": worker_r.mean().detach(),
             }
-            if self.actor_loss_type is not "dynamic":
+            if self.actor_loss_type != "dynamic":
                 logs.update(
                     {"ACT_advantage": advantage.detach().mean().item(),}
                 )

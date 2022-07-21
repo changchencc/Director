@@ -39,11 +39,10 @@ class OneHotAction:
 
 
 class TimeLimit:
-    def __init__(self, env, duration, time_penalty):
+    def __init__(self, env, duration):
         self._env = env
         self._step = None
         self._duration = duration
-        self.time_penalty = time_penalty
 
     def __getattr__(self, name):
         return getattr(self._env, name)
@@ -52,8 +51,6 @@ class TimeLimit:
         assert self._step is not None, "Must reset environment."
         obs, reward, done, info = self._env.step(action)
         self._step += 1
-        if self.time_penalty:
-            reward = reward - 1.0 / self._duration
 
         if self._step >= self._duration:
             done = True

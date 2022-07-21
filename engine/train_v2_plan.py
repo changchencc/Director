@@ -54,7 +54,6 @@ def simulate_test(model, test_env, cfg, global_step, device):
                 image.to(device),
                 action.to(device),
                 goal,
-                global_step,
                 state,
                 training=False,
                 sample_goal=(K % cfg.arch.manager.K == 0),
@@ -156,7 +155,6 @@ def train_16(model, cfg, device):
                     image.to(device),
                     action.to(device),
                     goal,
-                    global_step,
                     state,
                     sample_goal=(K % cfg.arch.manager.K == 0),
                 )

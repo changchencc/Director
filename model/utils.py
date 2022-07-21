@@ -434,12 +434,12 @@ class LayerNormGRUCellV2(nn.Module):
   This is used in dreamerV2.
   """
 
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size, hidden_size, bias=False):
         super().__init__()
         input_size = input_size + hidden_size
 
         self.fc = Linear(
-            input_size, 3 * hidden_size, bias=False
+            input_size, 3 * hidden_size, bias=bias
         )  # we have layernorm, bias is redundant
         # self.fc_h2h = Linear(hidden_size, 2*hidden_size, bias=False)
         # self.fc_i2c = Linear(input_size, hidden_size, bias=False)

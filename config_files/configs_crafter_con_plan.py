@@ -24,13 +24,10 @@ cfg = CN(
                 "RSSM": {
                     "act": "elu",
                     "weight_init": "xavier",
-                    "stoch_size": 1024,
-                    "stoch_discrete": 0,
+                    "stoch_size": 32,
+                    "stoch_discrete": 32,
                     "deter_size": 1024,
                     "hidden_size": 1024,
-                    "rnn_type": "LayerNormGRUV2",
-                    "ST": True,
-                    "post_no_deter": False,
                 },
                 "reward": {
                     "num_units": 400,

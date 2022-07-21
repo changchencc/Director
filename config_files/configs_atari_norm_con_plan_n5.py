@@ -28,8 +28,6 @@ cfg = CN(
                     "stoch_discrete": 0,
                     "deter_size": 600,
                     "hidden_size": 600,
-                    "rnn_type": "LayerNormGRUV2",
-                    "ST": True,
                 },
                 "reward": {
                     "num_units": 400,

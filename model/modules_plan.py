@@ -31,6 +31,7 @@ class RSSMWorldModel(nn.Module):
 
         self.stoch_discrete = cfg.arch.world_model.RSSM.stoch_discrete
         self.stoch_size = cfg.arch.world_model.RSSM.stoch_size
+        self.pcont = cfg.arch.world_model.RSSM.pcont
         if self.stoch_discrete:
             dense_input_size = (
                 cfg.arch.world_model.RSSM.deter_size
@@ -47,18 +48,17 @@ class RSSMWorldModel(nn.Module):
             norm=(cfg.arch.world_model.reward.norm != "none"),
         )
 
-        self.pcont = DenseDecoder(
-            dense_input_size,
-            cfg.arch.world_model.pcont.layers,
-            cfg.arch.world_model.pcont.num_units,
-            (1,),
-            dist="binary",
-            act="elu",
-            norm=(cfg.arch.world_model.reward.norm != "none"),
-        )
-        self.r_transform = dict(tanh=torch.tanh, sigmoid=torch.sigmoid,)[
-            cfg.rl.r_transform
-        ]
+        if self.pcont:
+            self.pcont = DenseDecoder(
+                dense_input_size,
+                cfg.arch.world_model.pcont.layers,
+                cfg.arch.world_model.pcont.num_units,
+                (1,),
+                dist="binary",
+                act="elu",
+                norm=(cfg.arch.world_model.reward.norm != "none"),
+            )
+        self.r_transform = torch.tanh
 
         self.pcont_scale = cfg.loss.pcont_scale
         self.kl_scale = cfg.loss.kl_scale
@@ -105,13 +105,14 @@ class RSSMWorldModel(nn.Module):
 
         reward_pred_pdf = self.reward(rnn_feature)  # B, T, 1
 
-        pred_pcont = self.pcont(rnn_feature)  # B, T, 1
-        pcont_target = self.discount * (1.0 - traj["done"].float())  # B, T
-        pcont_loss = -pred_pcont.log_prob(
-            (pcont_target.unsqueeze(2) > 0.5).float()
-        ).mean()  #
-        pcont_loss = self.pcont_scale * pcont_loss
-        discount_acc = (pred_pcont.mean == pcont_target.unsqueeze(2)).float().mean()
+        if self.pcont:
+            pred_pcont = self.pcont(rnn_feature)  # B, T, 1
+            pcont_target = self.discount * (1.0 - traj["done"].float())  # B, T
+            pcont_loss = -pred_pcont.log_prob(
+                (pcont_target.unsqueeze(2) > 0.5).float()
+            ).mean()  #
+            pcont_loss = self.pcont_scale * pcont_loss
+            discount_acc = (pred_pcont.mean == pcont_target.unsqueeze(2)).float().mean()
 
         image_pred_loss = -image_pred_pdf.log_prob(obs).mean().float()  # B, T
         mse_loss = (
@@ -119,6 +120,7 @@ class RSSMWorldModel(nn.Module):
             .flatten(start_dim=-3)
             .sum(-1)
             .mean()
+            .detach()
         )
         reward_pred_loss = -reward_pred_pdf.log_prob(reward.unsqueeze(2)).mean()  # B, T
         reward_nonzero_loss = (
@@ -165,13 +167,17 @@ class RSSMWorldModel(nn.Module):
                 "ACT_post_entropy": post_dist.entropy().mean().detach().item(),
                 "dec_img": image_pred_pdf.mean.detach() + 0.5,  # B, T, 3, 64, 64
                 "gt_img": obs + 0.5,
-                "pred_reward": pred_reward.detach().squeeze(-1),
-                "gt_reward": reward,
-                "reward_input": rnn_feature.detach(),
+                "ACT_pred_reward": pred_reward.detach().squeeze(-1),
+                "ACT_gt_reward": reward,
                 "Loss_model_discount_logprob_loss": pcont_loss.detach().item(),
-                "discount_acc": discount_acc.detach(),
-                "pred_discount": pred_pcont.mean.detach(),
             }
+            if self.pcont:
+                logs.update(
+                    {
+                        "pred_discount": pred_pcont.mean.detach(),
+                        "discount_acc": discount_acc.detach(),
+                    }
+                )
 
         else:
             logs = {}
@@ -200,42 +206,23 @@ class RSSMWorldModel(nn.Module):
 
         return grad_norm_model.item()
 
-    def optimize_world_model32(self, model_loss, model_optimizer):
-
-        model_loss.backward()
-        grad_norm_model = torch.nn.utils.clip_grad_norm_(
-            self.parameters(), self.grad_clip
-        )
-
-        if (global_step % self.log_every_step == 0) and self.log_grad:
-            for n, p in self.named_parameters():
-                if p.requires_grad:
-                    try:
-                        writer.add_scalar("grads/" + n, p.grad.norm(2), global_step)
-                    except:
-                        pdb.set_trace()
-
-        model_optimizer.step()
-
-        return grad_norm_model.item()
-
     def imagine_ahead(self, post_state, actor, mgr_actor):
         """
-    post_state:
-      mean: mean of q(s_t | h_t, o_t), (B*T, H)
-      std: std of q(s_t | h_t, o_t), (B*T, H)
-      stoch: s_t sampled from q(s_t | h_t, o_t), (B*T, H)
-      deter: h_t, (B*T, H)
-    """
+        post_state:
+          mean: mean of q(s_t | h_t, o_t), (B*T, H)
+          std: std of q(s_t | h_t, o_t), (B*T, H)
+          stoch: s_t sampled from q(s_t | h_t, o_t), (B*T, H)
+          deter: h_t, (B*T, H)
+        """
 
         self.eval()
         self.requires_grad_(False)
 
         def flatten(tensor):
             """
-      flatten the temporal dimension and the batch dimension.
-      tensor: B, T, *
-      """
+            flatten the temporal dimension and the batch dimension.
+            tensor: B, T, *
+            """
             shape = tensor.shape
             tensor = tensor.reshape([shape[0] * shape[1]] + [*tensor.shape[2:]])
             return tensor
@@ -401,73 +388,41 @@ class RSSM(nn.Module):
         action_size = cfg.env.action_size
         self.stoch_size = cfg.arch.world_model.RSSM.stoch_size
         self.stoch_discrete = cfg.arch.world_model.RSSM.stoch_discrete
-        self.ST = cfg.arch.world_model.RSSM.ST
-        self.post_no_deter = cfg.arch.world_model.RSSM.post_no_deter
         self.norm = cfg.arch.world_model.norm
+        self.bias = cfg.arch.world_model.RSSM.bias
 
         self.img_enc = ImgEncoder(cfg)
 
         weight_init = cfg.arch.world_model.RSSM.weight_init
         # RNN cell
-        if cfg.arch.world_model.RSSM.rnn_type == "GRU":
-            self.cell = GRUCell(hidden_size, deter_size)
-        elif cfg.arch.world_model.RSSM.rnn_type == "LayerNormGRU":
-            self.cell = LayerNormGRUCell(hidden_size, deter_size)
-        elif cfg.arch.world_model.RSSM.rnn_type == "LayerNormGRUV2":
-            self.cell = LayerNormGRUCellV2(hidden_size, deter_size)
+        self.cell = LayerNormGRUCellV2(hidden_size, deter_size, bias=self.bias)
+        if self.stoch_discrete:
+            latent_size = self.stoch_size * self.stoch_discrete
         else:
-            raise ValueError(
-                f"dynamic RNN type {cfg.dynamic.rnn_type} is not supported."
-            )
+            latent_size = 2 * self.stoch_size
 
         # MLP layers
         if self.stoch_discrete:
             self.act_stoch_mlp = Linear(
-                action_size + self.stoch_size * self.stoch_discrete,
-                hidden_size,
-                weight_init=weight_init,
+                action_size + latent_size, hidden_size, weight_init=weight_init,
             )
-            if self.post_no_deter:
-                self.post_stoch_mlp = MLP(
-                    [1536, hidden_size, self.stoch_size * self.stoch_discrete],
-                    act=act,
-                    weight_init=weight_init,
-                    norm=self.norm,
-                )
-            else:
-                self.post_stoch_mlp = MLP(
-                    [
-                        1536 + deter_size,
-                        hidden_size,
-                        self.stoch_size * self.stoch_discrete,
-                    ],
-                    act=act,
-                    weight_init=weight_init,
-                    norm=self.norm,
-                )
-            self.prior_stoch_mlp = MLP(
-                [deter_size, hidden_size, self.stoch_size * self.stoch_discrete],
-                act=act,
-                weight_init=weight_init,
-                norm=self.norm,
-            )
-
         else:
             self.act_stoch_mlp = Linear(
-                action_size + self.stoch_size, hidden_size, weight_init=weight_init
+                action_size + latent_size // 2, hidden_size, weight_init=weight_init,
             )
-            self.post_stoch_mlp = MLP(
-                [1536 + deter_size, hidden_size, 2 * self.stoch_size],
-                act=act,
-                weight_init=weight_init,
-                norm=self.norm,
-            )
-            self.prior_stoch_mlp = MLP(
-                [deter_size, hidden_size, 2 * self.stoch_size],
-                act=act,
-                weight_init=weight_init,
-                norm=self.norm,
-            )
+
+        self.post_stoch_mlp = MLP(
+            [1536 + deter_size, hidden_size, latent_size,],
+            act=act,
+            weight_init=weight_init,
+            norm=self.norm,
+        )
+        self.prior_stoch_mlp = MLP(
+            [deter_size, hidden_size, latent_size],
+            act=act,
+            weight_init=weight_init,
+            norm=self.norm,
+        )
 
     def init_state(self, batch_size, device):
         deter = self.cell.init_state(batch_size)
@@ -486,15 +441,15 @@ class RSSM(nn.Module):
 
     def forward(self, traj, prev_state):
         """
-    traj:
-      observations: embedding of observed images, B, T, C
-      actions: (one-hot) vector in action space, B, T, d_act
-      dones: scalar, B, T
+        traj:
+          observations: embedding of observed images, B, T, C
+          actions: (one-hot) vector in action space, B, T, d_act
+          dones: scalar, B, T
 
-    prev_state:
-      deter: GRU hidden state, B, h1
-      stoch: RSSM stochastic state, B, h2
-    """
+        prev_state:
+          deter: GRU hidden state, B, h1
+          stoch: RSSM stochastic state, B, h2
+        """
 
         obs = traj["image"]
         obs = obs / 255.0 - 0.5
@@ -607,8 +562,7 @@ class RSSM(nn.Module):
             )
             dist = Independent(OneHotCategorical(logits=logits), 1)
             stoch = dist.sample()
-            if self.ST:
-                stoch = stoch + dist.mean - dist.mean.detach()
+            stoch = stoch + dist.mean - dist.mean.detach()
 
             prior_state = {
                 "logits": logits,
@@ -632,10 +586,7 @@ class RSSM(nn.Module):
 
     def infer_post_stoch(self, observation, prev_deter):
 
-        if self.post_no_deter:
-            logits = self.post_stoch_mlp(observation)
-        else:
-            logits = self.post_stoch_mlp(torch.cat([observation, prev_deter], dim=-1))
+        logits = self.post_stoch_mlp(torch.cat([observation, prev_deter], dim=-1))
         logits = logits.float()
 
         if self.stoch_discrete:
@@ -646,8 +597,7 @@ class RSSM(nn.Module):
             dist = Independent(OneHotCategorical(logits=logits), 1)
 
             stoch = dist.sample()
-            if self.ST:
-                stoch = stoch + dist.mean - dist.mean.detach()
+            stoch = stoch + dist.mean - dist.mean.detach()
 
             post_state = {
                 "logits": logits,
@@ -818,12 +768,11 @@ class ImgDecoder(nn.Module):
             raise ValueError(f"decoder type {cfg.dec_type} is not supported.")
 
         self.shape = (self.c_out, 64, 64)
-        self.rec_sigma = cfg.arch.world_model.rec_sigma
 
     def forward(self, ipts):
         """
-    ipts: tensor, (B, T, C)
-    """
+        ipts: tensor, (B, T, C)
+        """
 
         shape = ipts.shape
 
@@ -832,7 +781,7 @@ class ImgDecoder(nn.Module):
         dec_o = dec_o.reshape([*shape[:2]] + [self.c_out, 64, 64])
 
         dec_pdf = Independent(
-            Normal(dec_o, self.rec_sigma * dec_o.new_ones(dec_o.shape)), len(self.shape)
+            Normal(dec_o, dec_o.new_ones(dec_o.shape)), len(self.shape)
         )
 
         return dec_pdf
@@ -1112,10 +1061,6 @@ class GoalVAE(nn.Module):
             norm=(cfg.arch.manager.actor.norm != "none"),
         )
 
-        if self.stoch_discrete:
-            self.dec_dist = "binary"
-        else:
-            self.dec_dist = "normal"
         self.dec = GoalDecoder(cfg)
         self.action_num = cfg.arch.manager.actor.action_num
         self.action_size = cfg.arch.manager.actor.action_size
