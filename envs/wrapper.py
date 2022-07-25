@@ -144,15 +144,16 @@ class NormalizeActions:
     def __init__(self, env):
         self._env = env
         self._mask = np.logical_and(
-            np.isfinite(env.action_space.low), np.isfinite(env.action_space.high)
+            np.isfinite(env.action_space["action"].low),
+            np.isfinite(env.action_space["action"].high),
         )
-        self._low = np.where(self._mask, env.action_space.low, -1)
-        self._high = np.where(self._mask, env.action_space.high, 1)
+        self._low = np.where(self._mask, env.action_space["action"].low, -1)
+        self._high = np.where(self._mask, env.action_space["action"].high, 1)
 
         self.random_actor = torchd.independent.Independent(
             torchd.uniform.Uniform(
-                torch.Tensor(env.action_space.low)[None],
-                torch.Tensor(env.action_space.high)[None],
+                torch.Tensor(env.action_space["action"].low)[None],
+                torch.Tensor(env.action_space["action"].high)[None],
             ),
             1,
         )

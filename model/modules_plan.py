@@ -4,9 +4,9 @@ from .utils import Conv2DBlock, ConvTranspose2DBlock, Linear
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Independent, Normal, Bernoulli, TransformedDistribution
+from torch.distributions import Independent, Normal, Bernoulli
 from torch.distributions import kl_divergence
-from .distributions import TanhBijector, SampleDist
+from .distributions import ContDist, SafeTruncatedNormal
 from .utils import (
     Conv2DBlock,
     ConvTranspose2DBlock,
@@ -76,6 +76,7 @@ class RSSMWorldModel(nn.Module):
         self.batch_length = cfg.train.batch_length
         self.grayscale = cfg.env.grayscale
         self.K = cfg.arch.manager.K
+        self.optimizer_type = cfg.optimize.type
 
     def forward(self, traj):
         raise NotImplementedError
@@ -151,7 +152,8 @@ class RSSMWorldModel(nn.Module):
         kl_loss = self.kl_scale * kl_loss
 
         model_loss = image_pred_loss + reward_pred_loss + kl_loss
-        model_loss = model_loss + pcont_loss
+        if self.pcont:
+            model_loss = model_loss + pcont_loss
 
         if global_step % self.log_every_step == 0:
             logs = {
@@ -169,13 +171,13 @@ class RSSMWorldModel(nn.Module):
                 "gt_img": obs + 0.5,
                 "ACT_pred_reward": pred_reward.detach().squeeze(-1),
                 "ACT_gt_reward": reward,
-                "Loss_model_discount_logprob_loss": pcont_loss.detach().item(),
             }
             if self.pcont:
                 logs.update(
                     {
                         "pred_discount": pred_pcont.mean.detach(),
                         "discount_acc": discount_acc.detach(),
+                        "Loss_model_discount_logprob_loss": pcont_loss.detach().item(),
                     }
                 )
 
@@ -184,8 +186,12 @@ class RSSMWorldModel(nn.Module):
 
         return model_loss, logs
 
+    def apply_weight_decay(self, varibs, wd):
+        for var in varibs:
+            var.data = (1 - wd) * var.data
+
     def optimize_world_model16(
-        self, model_loss, model_optimizer, scaler, global_step, writer
+        self, model_loss, model_optimizer, scaler, global_step, writer, wd
     ):
 
         scaler.scale(model_loss).backward()
@@ -193,6 +199,7 @@ class RSSMWorldModel(nn.Module):
         grad_norm_model = torch.nn.utils.clip_grad_norm_(
             self.parameters(), self.grad_clip
         )
+
         if (global_step % self.log_every_step == 0) and self.log_grad:
             for n, p in self.named_parameters():
                 if p.requires_grad:
@@ -247,9 +254,10 @@ class RSSMWorldModel(nn.Module):
 
             pred_action_pdf = actor(rnn_feature.detach(), g.detach())
             action = pred_action_pdf.sample()
-            action = (
-                action + pred_action_pdf.probs - pred_action_pdf.probs.detach()
-            )  # straight through
+            if self.pcont:
+                action = (
+                    action + pred_action_pdf.probs - pred_action_pdf.probs.detach()
+                )  # straight through
 
             pred_deter = self.dynamic.rnn_forward(
                 action, pred_prior["stoch"], pred_prior["deter"]
@@ -271,7 +279,10 @@ class RSSMWorldModel(nn.Module):
         mgr_action_list = torch.stack(mgr_action_list, dim=1)
 
         reward = self.reward(rnn_features).mean  # B*T, H, 1
-        discount = self.discount * self.pcont(rnn_features).mean  # B*T, H, 1
+        if self.pcont:
+            discount = self.discount * self.pcont(rnn_features).mean  # B*T, H, 1
+        else:
+            discount = self.discount * reward.new_ones(reward.shape)  # B*T, H, 1
 
         return (
             rnn_features,
@@ -325,17 +336,18 @@ class RSSMWorldModel(nn.Module):
             pred_reward = reward_pred_pdf.mean
             gt_reward = reward[:, self.n_sample :]
 
-            pred_pcont = self.pcont(rnn_features)  # B, T, 1
-            pcont_target = self.discount * (1.0 - traj["done"].float())  # B, T
-            pcont_loss = -pred_pcont.log_prob(
-                (pcont_target.unsqueeze(2)[:, self.n_sample :] > 0.5).float()
-            ).mean()  #
-            pred_pcont_loss = self.pcont_scale * pcont_loss
-            discount_acc = (
-                (pred_pcont.mean == pcont_target[:, self.n_sample :].unsqueeze(2))
-                .float()
-                .mean()
-            )
+            if self.pcont:
+                pred_pcont = self.pcont(rnn_features)  # B, T, 1
+                pcont_target = self.discount * (1.0 - traj["done"].float())  # B, T
+                pcont_loss = -pred_pcont.log_prob(
+                    (pcont_target.unsqueeze(2)[:, self.n_sample :] > 0.5).float()
+                ).mean()  #
+                pred_pcont_loss = self.pcont_scale * pcont_loss
+                discount_acc = (
+                    (pred_pcont.mean == pcont_target[:, self.n_sample :].unsqueeze(2))
+                    .float()
+                    .mean()
+                )
 
         imgs_act = torch.cat([rec_img, pred_imgs], dim=1)  # B, T, C, H, W
         err = gt_img - imgs_act
@@ -363,18 +375,20 @@ class RSSMWorldModel(nn.Module):
             pred_reward_nonzero_loss,
             global_step=global_step,
         )
-        writer.add_scalar(
-            "Gen-losses/discount_logprob_loss", pred_pcont_loss, global_step=global_step
-        )
-        writer.add_scalar(
-            "Gen-losses/discount_acc", discount_acc, global_step=global_step
-        )
+        if self.pcont:
+            writer.add_scalar(
+                "Gen-losses/discount_logprob_loss",
+                pred_pcont_loss,
+                global_step=global_step,
+            )
+            writer.add_scalar(
+                "Gen-losses/discount_acc", discount_acc, global_step=global_step
+            )
         writer.flush()
 
         return {
             "pred_reward": pred_reward.detach().squeeze(-1),
             "gt_reward": gt_reward,
-            "pred_discount": pred_pcont.mean.detach(),
         }
 
 
@@ -867,9 +881,9 @@ class ActionDecoder(nn.Module):
         units,
         dist="onehot",
         act="relu",
-        min_std=1e-4,
+        min_std=0.1,
         init_std=5,
-        mean_scale=5,
+        mean_scale=1,
         weight_init="xavier",
         norm=False,
     ):
@@ -895,7 +909,7 @@ class ActionDecoder(nn.Module):
                 module_list.append(nn.LayerNorm(dim_out))
             module_list.append(acts[act]())
 
-        if dist == "tanh_normal":
+        if dist == "trunc_normal":
             module_list.append(
                 Linear(dim_out, 2 * action_size, weight_init=weight_init)
             )
@@ -919,16 +933,14 @@ class ActionDecoder(nn.Module):
         if not self.worker_only:
             inpts = torch.cat([inpts, goal], dim=-1)
 
-        if self.dist == "tanh_normal":
+        if self.dist == "trunc_normal":
 
-            logits = self.dec(inpts)
+            logits = self.dec(inpts).float()
             mean, std = torch.chunk(logits, 2, -1)
             mean = self.mean_scale * torch.tanh(mean / self.mean_scale)
-            std = F.softplus(std + self.raw_init_std) + self.min_std
-            dist = Normal(mean, std)
-            dist = TransformedDistribution(dist, TanhBijector())
-            dist = torch.distributions.Independent(dist, 1)
-            dist = SampleDist(dist)
+            std = 2.0 * F.softplus(std / 2.0) + self.min_std
+            dist = SafeTruncatedNormal(mean, std, -1, 1)
+            dist = ContDist(torch.distributions.Independent(dist, 1))
 
         if self.dist == "onehot":
 
@@ -994,11 +1006,16 @@ class GoalDecoder(nn.Module):
 
         self.stoch_discrete = cfg.arch.world_model.RSSM.stoch_discrete
         self.stoch_size = cfg.arch.world_model.RSSM.stoch_size
+        self.input_type = cfg.arch.manager.input_type
+        self.deter_size = cfg.arch.world_model.RSSM.deter_size
 
-        if self.stoch_discrete:
-            output_dim = input_size = self.stoch_size * self.stoch_discrete
-        else:
-            output_dim = input_size = self.stoch_size
+        if self.input_type == "latent":
+            if self.stoch_discrete:
+                output_dim = input_size = self.stoch_size * self.stoch_discrete
+            else:
+                output_dim = input_size = self.stoch_size
+        elif self.input_type == "deter":
+            output_dim = input_size = self.deter_size
 
         self.dec = DenseDecoder(
             cfg.arch.manager.actor.action_num * cfg.arch.manager.actor.action_size,
@@ -1021,13 +1038,23 @@ class GoalDecoder(nn.Module):
         logits = self.dec(inpts)
         logits = logits.float()
 
-        if self.stoch_discrete:
-            pdf = OneHotCategorical(
-                logits=logits.reshape(
-                    *logits.shape[:-1], self.stoch_discrete, self.stoch_size
+        if self.input_type == "latent":
+            if self.stoch_discrete:
+                pdf = OneHotCategorical(
+                    logits=logits.reshape(
+                        *logits.shape[:-1], self.stoch_discrete, self.stoch_size
+                    )
                 )
-            )
-        else:
+            else:
+                if self.learn_std:
+
+                    mean, std = logits.chunk(2, dim=-1)
+                    std = 2.0 * torch.sigmoid(std / 2.0) + 0.1
+                    pdf = Independent(Normal(mean, std), len(self.output_shape))
+                else:
+                    pdf = Independent(Normal(logits, 1), len(self.output_shape))
+        elif self.input_type == "deter":
+
             if self.learn_std:
 
                 mean, std = logits.chunk(2, dim=-1)
@@ -1044,11 +1071,16 @@ class GoalVAE(nn.Module):
         super().__init__()
         self.stoch_discrete = cfg.arch.world_model.RSSM.stoch_discrete
         self.stoch_size = cfg.arch.world_model.RSSM.stoch_size
+        self.input_type = cfg.arch.manager.input_type
+        self.deter_size = cfg.arch.world_model.RSSM.deter_size
 
-        if self.stoch_discrete:
-            output_dim = input_size = self.stoch_size * self.stoch_discrete
-        else:
-            output_dim = input_size = self.stoch_size
+        if self.input_type == "latent":
+            if self.stoch_discrete:
+                output_dim = input_size = self.stoch_size * self.stoch_discrete
+            else:
+                output_dim = input_size = self.stoch_size
+        elif self.input_type == "deter":
+            output_dim = input_size = self.deter_size
 
         self.enc = GoalEncoder(
             input_size,
@@ -1086,13 +1118,14 @@ class ManagerValue(nn.Module):
 
         self.stoch_discrete = cfg.arch.world_model.RSSM.stoch_discrete
         self.stoch_size = cfg.arch.world_model.RSSM.stoch_size
+        self.input_type = cfg.arch.manager.input_type
+        deter_size = cfg.arch.world_model.RSSM.deter_size
 
         if self.stoch_discrete:
             input_size = self.stoch_size * self.stoch_discrete
         else:
             input_size = self.stoch_size
 
-        deter_size = cfg.arch.world_model.RSSM.deter_size
         input_size = input_size + deter_size
         self.intri_value = DenseDecoder(
             input_size,

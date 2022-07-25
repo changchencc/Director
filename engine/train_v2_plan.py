@@ -49,7 +49,7 @@ def simulate_test(model, test_env, cfg, global_step, device):
 
     with torch.no_grad():
         while not done:
-            image = torch.tensor(obs["image"])
+            image = torch.tensor(obs["image"].copy())
             action, state, goal = model.policy(
                 image.to(device),
                 action.to(device),
@@ -76,12 +76,13 @@ def train_16(model, cfg, device):
     input()
 
     optimizers = get_optimizer(cfg, model)
-    checkpointer = Checkpointer(
-        os.path.join(
-            cfg.checkpoint.checkpoint_dir, cfg.exp_name, cfg.env.name, cfg.run_id
-        ),
-        max_num=cfg.checkpoint.max_num,
+    checkpointer_path = os.path.join(
+        cfg.checkpoint.checkpoint_dir, cfg.exp_name, cfg.env.name, cfg.run_id
     )
+    checkpointer = Checkpointer(checkpointer_path, max_num=cfg.checkpoint.max_num,)
+    with open(checkpointer_path + "/config.yaml", "w") as f:
+        cfg.dump(stream=f, default_flow_style=False)
+        print(f"config file saved to {checkpointer_path + '/config.yaml'}")
 
     if cfg.resume:
         checkpoint = checkpointer.load(cfg.resume_ckpt)
@@ -89,7 +90,8 @@ def train_16(model, cfg, device):
         if checkpoint:
             model.load_state_dict(checkpoint["model"])
             for k, v in optimizers.items():
-                v.load_state_dict(checkpoint[k])
+                for i in range(len(v)):
+                    v[i].load_state_dict(checkpoint[k][i])
             env_step = checkpoint["env_step"]
             global_step = checkpoint["global_step"]
 
@@ -114,6 +116,9 @@ def train_16(model, cfg, device):
     )
     train_env = make_env(cfg, writer, "train", datadir, store=True)
     test_env = make_env(cfg, writer, "test", test_datadir, store=True)
+    if "dmc" in cfg.env.name:
+        acts = train_env.action_space
+        cfg.env.action_size = acts.n if hasattr(acts, "n") else acts.shape[0]
 
     # fill in length of 5000 frames
     train_env.reset()
@@ -142,7 +147,8 @@ def train_16(model, cfg, device):
     action = torch.zeros(1, cfg.env.action_size).float()
     action[0, 0] = 1.0
 
-    scaler = GradScaler()
+    if not cfg.optimize.seperate_scaler:
+        scaler = GradScaler()
 
     while global_step < cfg.total_steps:
 
@@ -150,7 +156,7 @@ def train_16(model, cfg, device):
             # print(f'collecting data, global step: {global_step}')
             with torch.no_grad():
                 model.eval()
-                image = torch.tensor(obs["image"])
+                image = torch.tensor(obs["image"].copy())
                 action, state, goal = model.policy(
                     image.to(device),
                     action.to(device),
@@ -179,7 +185,12 @@ def train_16(model, cfg, device):
             for k, v in traj.items():
                 traj[k] = v.to(device)
 
-            model_optimizer = optimizers["model_optimizer"]
+            # very complex way to do this experiment!!!
+            if cfg.optimize.seperate_scaler:
+                model_optimizer, model_scaler = optimizers["model_optimizer"]
+            else:
+                model_optimizer = optimizers["model_optimizer"][0]
+
             model_optimizer.zero_grad()
 
             with autocast():
@@ -190,22 +201,68 @@ def train_16(model, cfg, device):
                     post_state,
                 ) = model.world_model_loss(global_step, traj)
 
-            grad_norm_model = model.world_model.optimize_world_model16(
-                model_loss, model_optimizer, scaler, global_step, writer
-            )
+            if cfg.optimize.seperate_scaler:
+                grad_norm_model = model.world_model.optimize_world_model16(
+                    model_loss,
+                    model_optimizer,
+                    model_scaler,
+                    global_step,
+                    writer,
+                    cfg.optimize.model.weight_decay,
+                )
+                model_scaler.update()
+            else:
+                grad_norm_model = model.world_model.optimize_world_model16(
+                    model_loss,
+                    model_optimizer,
+                    scaler,
+                    global_step,
+                    writer,
+                    cfg.optimize.model.weight_decay,
+                )
 
-            goal_vae_optimizer = optimizers["goal_vae_optimizer"]
+            if cfg.optimize.seperate_scaler:
+                goal_vae_optimizer, goal_vae_scaler = optimizers["goal_vae_optimizer"]
+            else:
+                goal_vae_optimizer = optimizers["goal_vae_optimizer"][0]
             goal_vae_optimizer.zero_grad()
             with autocast():
                 goal_loss, goal_logs = model.goal_vae_loss(post_state)
-            grad_norm_goalvae = model.optimize_goalvae16(
-                goal_loss, goal_vae_optimizer, scaler, global_step, writer
-            )
 
-            actor_optimizer = optimizers["actor_optimizer"]
-            value_optimizer = optimizers["value_optimizer"]
-            mgr_actor_optimizer = optimizers["mgr_actor_optimizer"]
-            mgr_value_optimizer = optimizers["mgr_value_optimizer"]
+            if cfg.optimize.seperate_scaler:
+                grad_norm_goalvae = model.optimize_goalvae16(
+                    goal_loss,
+                    goal_vae_optimizer,
+                    goal_vae_scaler,
+                    global_step,
+                    writer,
+                    cfg.optimize.goal_vae.weight_decay,
+                )
+                goal_vae_scaler.update()
+            else:
+                grad_norm_goalvae = model.optimize_goalvae16(
+                    goal_loss,
+                    goal_vae_optimizer,
+                    scaler,
+                    global_step,
+                    writer,
+                    cfg.optimize.goal_vae.weight_decay,
+                )
+
+            if cfg.optimize.seperate_scaler:
+                actor_optimizer, actor_scaler = optimizers["actor_optimizer"]
+                value_optimizer, value_scaler = optimizers["value_optimizer"]
+                mgr_actor_optimizer, mgr_actor_scaler = optimizers[
+                    "mgr_actor_optimizer"
+                ]
+                mgr_value_optimizer, mgr_value_scaler = optimizers[
+                    "mgr_value_optimizer"
+                ]
+            else:
+                actor_optimizer = optimizers["actor_optimizer"][0]
+                value_optimizer = optimizers["value_optimizer"][0]
+                mgr_actor_optimizer = optimizers["mgr_actor_optimizer"][0]
+                mgr_value_optimizer = optimizers["mgr_value_optimizer"][0]
             actor_optimizer.zero_grad()
             value_optimizer.zero_grad()
             mgr_actor_optimizer.zero_grad()
@@ -219,21 +276,89 @@ def train_16(model, cfg, device):
                     actor_value_logs,
                 ) = model.actor_and_value_loss(global_step, post_state)
 
-            grad_norm_actor = model.optimize_actor16(
-                actor_loss, actor_optimizer, scaler, global_step, writer
-            )
-            grad_norm_value = model.optimize_value16(
-                value_loss, value_optimizer, scaler, global_step, writer
-            )
-            if not cfg.arch.worker_only:
-                grad_norm_mgr_actor = model.optimize_mgr_actor16(
-                    mgr_actor_loss, mgr_actor_optimizer, scaler, global_step, writer
+            if cfg.optimize.seperate_scaler:
+                grad_norm_actor = model.optimize_actor16(
+                    actor_loss,
+                    actor_optimizer,
+                    actor_scaler,
+                    global_step,
+                    writer,
+                    cfg.optimize.actor.weight_decay,
                 )
-                grad_norm_mgr_value = model.optimize_mgr_value16(
-                    mgr_value_loss, mgr_value_optimizer, scaler, global_step, writer
+                actor_scaler.update()
+
+            else:
+                grad_norm_actor = model.optimize_actor16(
+                    actor_loss,
+                    actor_optimizer,
+                    scaler,
+                    global_step,
+                    writer,
+                    cfg.optimize.actor.weight_decay,
                 )
 
-            scaler.update()
+            if cfg.optimize.seperate_scaler:
+                grad_norm_value = model.optimize_value16(
+                    value_loss,
+                    value_optimizer,
+                    value_scaler,
+                    global_step,
+                    writer,
+                    cfg.optimize.value.weight_decay,
+                )
+                value_scaler.update()
+            else:
+                grad_norm_value = model.optimize_value16(
+                    value_loss,
+                    value_optimizer,
+                    scaler,
+                    global_step,
+                    writer,
+                    cfg.optimize.value.weight_decay,
+                )
+            if not cfg.arch.worker_only:
+                if cfg.optimize.seperate_scaler:
+                    grad_norm_mgr_actor = model.optimize_mgr_actor16(
+                        mgr_actor_loss,
+                        mgr_actor_optimizer,
+                        mgr_actor_scaler,
+                        global_step,
+                        writer,
+                        cfg.optimize.mgr_actor.weight_decay,
+                    )
+                    mgr_actor_scaler.update()
+                else:
+                    grad_norm_mgr_actor = model.optimize_mgr_actor16(
+                        mgr_actor_loss,
+                        mgr_actor_optimizer,
+                        scaler,
+                        global_step,
+                        writer,
+                        cfg.optimize.mgr_actor.weight_decay,
+                    )
+
+                if cfg.optimize.seperate_scaler:
+                    grad_norm_mgr_value = model.optimize_mgr_value16(
+                        mgr_value_loss,
+                        mgr_value_optimizer,
+                        mgr_value_scaler,
+                        global_step,
+                        writer,
+                        cfg.optimize.mgr_value.weight_decay,
+                    )
+                    mgr_value_scaler.update()
+                else:
+                    grad_norm_mgr_value = model.optimize_mgr_value16(
+                        mgr_value_loss,
+                        mgr_value_optimizer,
+                        scaler,
+                        global_step,
+                        writer,
+                        cfg.optimize.mgr_value.weight_decay,
+                    )
+
+            if not cfg.optimize.seperate_scaler:
+                scaler.update()
 
             if global_step % cfg.train.log_every_step == 0:
                 with torch.no_grad():

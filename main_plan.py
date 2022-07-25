@@ -2,7 +2,7 @@ import torch
 from configs import cfg
 from engine.train_v2_plan import train_32, train_16
 from model import get_model
-from envs.atari_env import Atari
+from envs.dmc import DeepMindControl
 import os
 import argparse
 import pdb
@@ -45,11 +45,12 @@ def get_config():
 
     return task, cfg
 
+
 if __name__ == "__main__":
     task, cfg = get_config()
-    # if 'atari' in cfg.env.name:
-    #   dummy_env = Atari(cfg.env.name.split('_', 1)[1])
-    #   cfg.env.action_size = dummy_env.action_space.n
+    if "dmc" in cfg.env.name:
+        dummy_env = DeepMindControl(cfg.env.name.split("_", 1)[1])
+        cfg.env.action_size = dummy_env.action_space["action"].shape[0]
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = get_model(cfg, device, cfg.seed)
     task(model, cfg, device)
